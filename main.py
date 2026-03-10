@@ -1,89 +1,150 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset, Subset
+import numpy as np
+import struct
+import os
 
-# 1. 모델 정의 (LeNet-5)
+# --- [설정: 정확도 조절 및 환경 설정] ---
+SUBSET_RATIO = 0.05   # 학습 데이터 사용량 (정확도를 낮추기 위해 조정)
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+EPOCHS = 2
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 1. IDX 바이너리 파일 읽기 함수
+def read_idx(filename):
+    with open(filename, 'rb') as f:
+        zero, data_type, dims = struct.unpack('>HBB', f.read(4))
+        shape = tuple(struct.unpack('>I', f.read(4))[0] for d in range(dims))
+        return np.frombuffer(f.read(), dtype=np.uint8).reshape(shape)
+
+# 2. 데이터 로드 및 전처리
+raw_path = './data/raw/'
+try:
+    train_images = read_idx(os.path.join(raw_path, 'train-images-idx3-ubyte'))
+    train_labels = read_idx(os.path.join(raw_path, 'train-labels-idx1-ubyte'))
+    test_images = read_idx(os.path.join(raw_path, 't10k-images-idx3-ubyte'))
+    test_labels = read_idx(os.path.join(raw_path, 't10k-labels-idx1-ubyte'))
+except FileNotFoundError:
+    print("에러: data/raw/ 폴더에 MNIST 바이너리 파일이 없습니다.")
+    exit()
+
+# Tensor 변환 및 정규화
+train_X = torch.tensor(train_images, dtype=torch.float32).unsqueeze(1) / 255.0
+train_y = torch.tensor(train_labels, dtype=torch.long)
+test_X = torch.tensor(test_images, dtype=torch.float32).unsqueeze(1) / 255.0
+test_y = torch.tensor(test_labels, dtype=torch.long)
+
+full_train_ds = TensorDataset(train_X, train_y)
+test_ds = TensorDataset(test_X, test_y)
+
+# 일부 데이터만 추출 (정확도 70%대 유도)
+train_indices = list(range(int(len(full_train_ds) * SUBSET_RATIO)))
+train_subset = Subset(full_train_ds, train_indices)
+
+# shuffle=False (데이터 순서 고정 연구용)
+train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+# 3. LeNet-5 모델 정의
 class LeNet5(nn.Module):
     def __init__(self):
         super(LeNet5, self).__init__()
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=2), # 28x28 -> 28x28
-            nn.ReLU(),
-            nn.AvgPool2d(kernel_size=2, stride=2),               # 28x28 -> 14x14
-            nn.Conv2d(6, 16, kernel_size=5, stride=1),          # 14x14 -> 10x10
-            nn.ReLU(),
-            nn.AvgPool2d(kernel_size=2, stride=2),               # 10x10 -> 5x5
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 6, 5, padding=2), nn.ReLU(),
+            nn.AvgPool2d(2, 2),
+            nn.Conv2d(6, 16, 5), nn.ReLU(),
+            nn.AvgPool2d(2, 2)
         )
         self.classifier = nn.Sequential(
-            nn.Linear(16 * 5 * 5, 120),
-            nn.ReLU(),
-            nn.Linear(120, 84),
-            nn.ReLU(),
-            nn.Linear(84, 10),
+            nn.Linear(16*5*5, 120), nn.ReLU(),
+            nn.Linear(120, 84), nn.ReLU(),
+            nn.Linear(84, 10)
         )
-
     def forward(self, x):
-        x = self.feature_extractor(x)
-        x = torch.flatten(x, 1)
-        logits = self.classifier(x)
-        return logits
+        x = self.features(x)
+        x = x.view(-1, 16*5*5)
+        return self.classifier(x)
 
-# 2. 하이퍼파라미터 설정
-batch_size = 64
-learning_rate = 0.001
-epochs = 3  # 정확도가 너무 높지 않게 하려면 에포크를 낮게 설정하세요.
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# 3. 데이터 로드 (여기서 shuffle=True/False가 데이터 순서 연구의 핵심입니다)
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
-
-train_dataset = torchvision.datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-test_dataset = torchvision.datasets.MNIST(root='./data', train=False, transform=transform)
-
-# 연구 포인트: shuffle을 False로 하고 직접 샘플러를 만들면 순서 제어가 가능합니다.
-train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False)
-
-# 4. 모델, 손실함수, 최적화 도구 초기화
-model = LeNet5().to(device)
+model = LeNet5().to(DEVICE)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# 5. 학습 (Train)
-print("학습 시작...")
+# 4. 학습 루프
+print(f"학습 시작 (데이터 사용량: {SUBSET_RATIO*100}%)...")
 model.train()
-for epoch in range(epochs):
-    running_loss = 0.0
-    for i, (images, labels) in enumerate(train_loader):
-        images, labels = images.to(device), labels.to(device)
-        
+for epoch in range(EPOCHS):
+    for images, labels in train_loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(model(images), labels)
         loss.backward()
         optimizer.step()
-        
-        running_loss += loss.item()
-        if (i+1) % 100 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}')
+    print(f"Epoch [{epoch+1}/{EPOCHS}] 완료")
 
-# 6. 테스트 (Test)
-print("\n테스트 시작...")
+# 5. 테스트 및 맞은 것/틀린 것 분류 추출
+print("\n테스트 및 데이터 분류 중...")
 model.eval()
-with torch.no_grad():
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
 
-    print(f'최종 테스트 정확도: {100 * correct / total:.2f}%')
+wrong_images, wrong_labels, predicted_labels = [], [], []
+correct_images, correct_labels = [], []
+total_correct = 0
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+        
+        # 틀린 데이터 마스킹
+        wrong_mask = (preds != labels)
+        if wrong_mask.any():
+            wrong_images.append(images[wrong_mask].cpu())
+            wrong_labels.append(labels[wrong_mask].cpu())
+            predicted_labels.append(preds[wrong_mask].cpu())
+            
+        # 맞은 데이터 마스킹
+        correct_mask = (preds == labels)
+        if correct_mask.any():
+            correct_images.append(images[correct_mask].cpu())
+            correct_labels.append(labels[correct_mask].cpu())
+            
+        total_correct += correct_mask.sum().item()
+
+# 텐서 합치기
+all_wrong_imgs = torch.cat(wrong_images)
+all_wrong_labs = torch.cat(wrong_labels)
+all_preds = torch.cat(predicted_labels)
+
+all_correct_imgs = torch.cat(correct_images)
+all_correct_labs = torch.cat(correct_labels)
+
+final_acc = (total_correct / len(test_ds)) * 100
+
+# 6. 결과 저장
+results_path = './results'
+os.makedirs(results_path, exist_ok=True)
+
+# 틀린 데이터 저장 (.pt)
+torch.save({
+    'images': all_wrong_imgs,
+    'labels': all_wrong_labs,
+    'predictions': all_preds
+}, os.path.join(results_path, 'wrong_data.pt'))
+
+# 맞은 데이터 저장 (.pt)
+torch.save({
+    'images': all_correct_imgs,
+    'labels': all_correct_labs
+}, os.path.join(results_path, 'correct_data.pt'))
+
+print("-" * 35)
+print(f"최종 테스트 정확도: {final_acc:.2f}%")
+print(f"맞은 데이터 개수: {len(all_correct_imgs)}개 -> correct_data.pt 저장됨")
+print(f"틀린 데이터 개수: {len(all_wrong_imgs)}개 -> wrong_data.pt 저장됨")
+print("-" * 35)
+
+if len(all_wrong_labs) > 0:
+    print(f"샘플(틀린 것) - 실제정답: {all_wrong_labs[0]}, 모델예측: {all_preds[0]}")
